@@ -1,0 +1,306 @@
+x-airflow-common: &airflow-common
+  build:
+      context: .
+      dockerfile: ./src/infra/airflow.Dockerfile
+  env_file:
+    - ./src/infra/airflow.env
+  volumes:
+    - ./src/app/airflow/dags:/opt/airflow/dags
+    - ./src/logs/airflow:/opt/airflow/logs
+    - ./src/app/spark/:/opt/airflow/app/spark/
+    - ./src/infra/metrics.properties:/opt/spark/conf/metrics.properties
+
+
+services:
+  locust:
+    build:
+      context: .
+      dockerfile: ./src/infra/locust.Dockerfile
+    ports:
+      - "8089:8089"
+      - "8000:8000"  # Exportation des métriques Prometheus
+    volumes:
+      - ./src/app/locust/:/mnt/locust/
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: [ "-f", "smart_meter_locustfile.py", "--host", "http://kafka:9092" ]
+    networks:
+      - monitoring
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment: 
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - monitoring
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    env_file:
+      - ./src/infra/kafka.env
+    volumes:
+      - ./src/scripts/kafka-init-topic.sh:/home/appuser/init-topic.sh
+    command: ["sh", "-c", "kafka-server-start /etc/kafka/server.properties --override zookeeper.connect=zookeeper:2181 --override log.dirs=/var/lib/kafka/logs & /home/appuser/init-topic.sh && wait"]
+    networks:
+      - monitoring
+
+  spark-master:
+    image: bitnami/spark:3.5.3
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - HDFS_NAMENODE_HOST=namenode
+      - MLFLOW_TRACKING_URI=http://mlflow:5001
+    depends_on:
+      - namenode
+      - datanode
+      - mlflow
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./src/app/spark:/opt/spark/work-dir
+      - ./src/infra/metrics.properties:/opt/spark/conf/metrics.properties
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      monitoring:
+        aliases:
+          - spark-master
+          - namenode
+
+
+  spark-worker:
+    image: bitnami/spark:3.5.3
+    depends_on:
+      - spark-master
+      - namenode
+      - datanode
+      - mlflow
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - HDFS_NAMENODE_HOST=namenode
+      - MLFLOW_TRACKING_URI=http://mlflow:5001
+    volumes:
+      - ./src/app/spark:/opt/spark/work-dir
+      - ./src/infra/metrics.properties:/opt/spark/conf/metrics.properties
+    networks:
+      - monitoring
+
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - monitoring
+    
+  airflow-scheduler:
+    <<: *airflow-common
+    command: bash -c "airflow db migrate && python /opt/airflow/scripts/init-airflow-spark-connection.py && airflow users create --username admin --firstname essai --lastname essai --role Admin --email air@gmail.com --password admin && airflow scheduler"
+    healthcheck:
+      test: [ "CMD", "pgrep", "-f", "airflow" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    environment:
+      - PYTHONPATH=/opt/airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      #spark-master:
+        #condition: service_healthy
+      #namenode:
+        #condition: service_healthy
+    working_dir: /opt/airflow
+    networks:
+      - monitoring
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "9095:8080"
+    environment:
+      - PYTHONPATH=/opt/airflow
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-scheduler:
+        condition: service_healthy
+      #spark-master:
+        #condition: service_healthy
+      #namenode:
+        #condition: service_healthy
+    working_dir: /opt/airflow
+    networks:
+      - monitoring
+
+  namenode:
+    image: arminzolfagharid/hadoop-namenode:v2-hadoop3.2.1
+    container_name: namenode
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    restart: always
+    env_file:
+      - ./src/infra/hadoop.env
+    environment:
+      - CLUSTER_NAME=test
+    networks:
+      monitoring:
+        aliases:
+          - namenode
+    
+  datanode:
+    image: arminzolfagharid/hadoop-datanode:v2-hadoop3.2.1
+    container_name: datanode
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    restart: always
+    env_file:
+      - ./src/infra/hadoop.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+      CLUSTER_NAME: test
+    
+  resourcemanager:
+    image: arminzolfagharid/hadoop-resourcemanager:v2-hadoop3.2.1
+    container_name: resourcemanager
+    restart: always
+    env_file:
+      - ./src/infra/hadoop.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864"
+    
+  nodemanager1:
+    image: arminzolfagharid/hadoop-nodemanager:v2-hadoop3.2.1
+    container_name: nodemanager
+    restart: always
+    env_file:
+      - ./src/infra/hadoop.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
+  
+  historyserver:
+    image: arminzolfagharid/hadoop-historyserver:v2-hadoop3.2.1
+    container_name: historyserver
+    restart: always
+    env_file:
+      - ./src/infra/hadoop.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
+    volumes:
+      - hadoop_historyserver:/hadoop/yarn/timeline
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow
+    ports:
+      - "5001:5000"
+    environment:
+      - BACKEND_STORE_URI=sqlite:///mlflow.db
+      - ARTIFACT_ROOT=/mlflow/artifacts
+    volumes:
+      - ./mlflow:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "0.5"
+        reservations:
+          memory: 1G
+          cpus: "0.25"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090" # Port pour accéder à l'interface Prometheus
+    volumes:
+      - ./src/infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml # Fichier de configuration Prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    restart: always
+    networks:
+      - monitoring
+
+  ### grafana
+  grafana:
+        image: grafana/grafana:latest
+        container_name: grafana
+        ports:
+         - "3000:3000"
+        depends_on:
+         - prometheus
+        environment:
+         - GF_SECURITY_ADMIN_PASSWORD=admin
+         - GF_SECURITY_ADMIN_USER=admin
+        networks:
+          - monitoring
+
+  pushgateway:
+    image: prom/pushgateway:latest
+    container_name: pushgateway
+    ports:
+      - "9091:9091"  # Port d'exposition du Pushgateway
+    restart: always
+    networks:
+      - monitoring
+
+
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  hadoop_historyserver:
+
+networks:
+  monitoring:
+    driver: bridge
