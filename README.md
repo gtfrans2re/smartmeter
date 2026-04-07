@@ -14,7 +14,7 @@
 
 | Name and Surname | Student Email | GitHub Username | Study Program |
 | :--- | :--- | :--- | :--- |
-| Francois Gonothi Toure | toure.francois_gonothi@courrier.uqam.ca | @gtfrans2re | M.Sc. in Computer Science (Electronic Systems) |
+| Francois Gonothi Toure | toure.francois_gonothi@courrier.uqam.ca | @gtfrans2re | M.Sc. in Computer Science (Artificial Intelligence) |
 | Ben Bachir Aboubakar Nabil | aboubakar_nabil.ben_bachir@courrier.uqam.ca | @BenBachirAboubakarNabil | M.Sc. in Software Engineering |
 | Martial Zachee Kaljob Kollo | kaljob_kollo.martial_zachee@courrier.uqam.ca | @kaljob | M.Sc. in Computer Science (AI and Data Management) |
 | Sokhna Mariame Ndour | ndour.sokhna_mariame@courrier.uqam.ca | @zeyda97 | M.Sc. in Computer Science (Artificial Intelligence) |
