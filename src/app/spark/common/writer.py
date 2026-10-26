@@ -1,64 +1,63 @@
 from app.spark.common.kafkaconfig import KafkaConfig
-from app.spark.common.deltaconfig import DeltaConfig
 from app.spark.common.config import Config
 from pyspark.ml.regression import LinearRegressionModel
+
 
 class Writer:
     def __init__(self):
         self.kafka_config = KafkaConfig()
-        self.delta_config = DeltaConfig()
 
-    def write_stream_to_kafka(self, df):
-        """
-        Writes streaming data to Kafka topics.
-        """
+    def write_stream_to_kafka(self, df, topic: str = None, checkpoint: str = None):
+        """Write a streaming DataFrame that already has a string ``value`` column to Kafka."""
+        if topic is None:
+            topic = self.kafka_config.output_topic
+        if checkpoint is None:
+            checkpoint = f"/tmp/checkpoint-kafka-{topic}"
         return (
             df.writeStream
             .format("kafka")
             .option("kafka.bootstrap.servers", self.kafka_config.bootstrap_servers)
-            .option("topic", self.kafka_config.output_topic)
-            .option("checkpointLocation", self.kafka_config.checkpoint_location)
-            .trigger(processingTime="1 minute")
-            .outputMode("complete")
+            .option("topic", topic)
+            .option("checkpointLocation", checkpoint)
+            .outputMode("append")
             .start()
             .awaitTermination()
         )
 
-    def write_stream_to_delta(self, df, path: str = None):
-        """
-        Writes streaming data to Delta Lake. If no path is provided, uses the default from config.
-        """
+    def write_stream_to_hdfs(self, df, path: str = None, checkpoint: str = None):
+        """Append a streaming DataFrame to HDFS as parquet (the data lake landing zone)."""
         if path is None:
             path = Config.HDFS_DATA_LAKE_PATH
+        if checkpoint is None:
+            checkpoint = f"{path}/_checkpoints"
         return (
             df.writeStream
-            .option("checkpointLocation", "/tmp")
+            .format("parquet")
+            .option("checkpointLocation", checkpoint)
             .option("path", path)
             .outputMode("append")
-            .trigger(processingTime="1 minute")
+            .trigger(processingTime="30 seconds")
             .start()
             .awaitTermination()
         )
 
-    def save_model_to_hdfs(self, model: LinearRegressionModel, path: str = None):
-        """
-        Saves the trained machine learning model to HDFS. If no path is provided, uses the default model path from config.
-        Args:
-            model: The trained Spark MLlib model to save.
-            path (str): HDFS path to save the model.
-        """
+    # Kept for backward compatibility with older call sites.
+    write_stream_to_delta = write_stream_to_hdfs
+
+    def write_batch_to_hdfs(self, df, path: str, mode: str = "overwrite"):
+        """Write a (non-streaming) batch DataFrame to HDFS as parquet."""
+        df.write.mode(mode).parquet(path)
+        print(f"Batch data written to HDFS: {path}")
+
+    def save_model_to_hdfs(self, model, path: str = None):
+        """Save a trained Spark ML model to HDFS."""
         if path is None:
             path = Config.HDFS_MODEL_PATH + "model_lr"
-        model.save(path)
+        model.write().overwrite().save(path)
+        print(f"Model saved to HDFS: {path}")
 
     def write_to_hive(self, df, table_name: str = None, mode="overwrite"):
-        """
-        Writes a DataFrame to a Hive table. If no table name is provided, uses the default from config.
-        Args:
-            df (pyspark.sql.DataFrame): DataFrame to write to the Hive table.
-            table_name (str): Target Hive table name.
-            mode (str): Write mode, e.g., "overwrite" or "append". Default is "overwrite".
-        """
+        """Write a DataFrame to a Hive table (requires a configured metastore)."""
         if table_name is None:
             table_name = Config.HIVE_TABLE_NAME
         try:

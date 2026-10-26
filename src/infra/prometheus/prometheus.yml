@@ -1,5 +1,5 @@
 global:
-  scrape_interval: 30s  # Intervalle global pour tous les jobs
+  scrape_interval: 30s
 
 scrape_configs:
   - job_name: 'locust'
@@ -8,16 +8,23 @@ scrape_configs:
 
   - job_name: 'spark_master'
     static_configs:
-      - targets: ['spark-master:8080']  # Expose metrics from Spark master
+      - targets: ['spark-master:8080']
 
   - job_name: 'spark_worker'
     static_configs:
-      - targets: ['spark-worker:8081']  # Expose metrics from Spark worker
+      - targets: ['spark-worker:8081']
 
+  # spark_app1 / spark_app5 start their own prometheus_client HTTP server.
+  # With Airflow's SparkSubmitOperator (client mode) the driver runs inside the
+  # airflow-scheduler container, so that is where ports 8001/8005 are exposed.
   - job_name: 'spark_app1'
     static_configs:
-      - targets: ['localhost:8001']  # Replace with the actual metrics endpoint of spark_app1
+      - targets: ['airflow-scheduler:8001']
 
   - job_name: 'spark_app5'
     static_configs:
-      - targets: ['localhost:8005']  # Replace with the actual metrics endpoint of spark_app5
+      - targets: ['airflow-scheduler:8005']
+
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']

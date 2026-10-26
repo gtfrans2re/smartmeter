@@ -1,98 +1,87 @@
-import random
-from datetime import datetime, timezone
-from locust import HttpUser, TaskSet, task, between
-from confluent_kafka import Producer
+"""Locust load generator for the smart-meter pipeline.
+
+Each simulated user produces smart-meter readings to Kafka using the SAME
+canonical contract the Spark jobs consume:
+
+    topic   : sensor-data
+    payload : {"meter_id": <int>, "voltage": <float>, "timestamp": <float epoch>}
+
+It also emits forecast requests to the ``forecast-data`` topic (consumed by
+spark_app5) and exposes Prometheus metrics on :8000.
+
+Run from the Locust container (see docker-compose); the realistic voltage values
+come from the interpolated provider classes in this folder.
+"""
 import json
+import random
+import time
 
-
+from locust import User, TaskSet, task, between
+from confluent_kafka import Producer
 from prometheus_client import start_http_server, Gauge
 
-from interpolatedProfile import InterpolatedProfileByUsagePoint
-from timeProvider import TimeProvider
 from valueProvider import ConsumerInterpolatedVoltageProvider
 
-# Initialisation des métriques Prometheus
-cpu_usage_metric = Gauge('locust_cpu_usage', 'Simulated CPU usage data')
-voltage_metric = Gauge('locust_voltage_data', 'Simulated voltage data')
+# Prometheus metrics (scraped by Prometheus at locust:8000).
+cpu_usage_metric = Gauge('locust_cpu_usage', 'Simulated CPU usage')
+voltage_metric = Gauge('locust_voltage_data', 'Last simulated voltage value')
 
-start_http_server(8000)  # Démarrage du serveur Prometheus
+start_http_server(8000)
+
+SENSOR_TOPIC = "sensor-data"
+FORECAST_TOPIC = "forecast-data"
+
 
 class SmartMeterBehavior(TaskSet):
     def on_start(self):
-        """Initialisation avant le début de la simulation."""
-        self.slot = 1  # Identifiant fictif de slot pour chaque utilisateur
-        self.users_per_sec = 100  # Paramètre arbitraire pour le débit
-        self.streaming_duration = 60  # Durée de streaming en secondes
-        self.randomness = 0.5  # Facteur de variation aléatoire
-        self.prediction_length = 12  # Longueur de la prévision
-        
-        # Initialisation des fournisseurs
         self.voltage_provider = ConsumerInterpolatedVoltageProvider(
-            slot=self.slot,
-            users_per_sec=self.users_per_sec,
-            streaming_duration=self.streaming_duration,
-            randomness=self.randomness,
-            prediction_length=self.prediction_length,
+            slot=1, users_per_sec=100, streaming_duration=60,
+            randomness=0.5, prediction_length=12,
         )
-        self.profile_provider = InterpolatedProfileByUsagePoint()
-        self.time_provider = TimeProvider()
-
-        # Initialisation du Kafka Producer avec Confluent Kafka
-        self.producer_conf = {
-            'bootstrap.servers': 'kafka:9092',  # Remplacez par l'adresse de votre broker Kafka
-            'client.id': 'smart-meter-client'
-        }
-        self.producer = Producer(self.producer_conf)
+        self.meter_id = random.randint(1, 50)
+        self.producer = Producer({
+            'bootstrap.servers': 'kafka:9092',
+            'client.id': 'smart-meter-client',
+        })
 
     def on_stop(self):
-        """Méthode appelée à la fin de chaque utilisateur pour fermer la connexion Kafka"""
         self.producer.flush()
 
+    def _send(self, topic, message):
+        self.producer.produce(topic, value=json.dumps(message).encode('utf-8'))
+        self.producer.poll(0)
+
     @task(3)
-    def send_temperature_data(self):
-        """Envoie des données de température simulées à Kafka."""
-        subject = self.voltage_provider.get_subject()
-        if subject == ".temperature.data":
-            payload = self.voltage_provider.get_payload()
-            data = {'type': 'temperature', 'data': payload} 
-            self.producer.produce('temperature_data', value=json.dumps(data).encode('utf-8'))
-            # Envoie les données au topic Kafka "temperature_data"
-            print(f"Temperature data sent: {payload}")
-
-    @task(2)
     def send_voltage_data(self):
-        """Envoie des données de tension simulées à Kafka."""
-        subject = self.voltage_provider.get_subject()
-        if ".voltage.data" in subject:
-            payload = self.voltage_provider.get_payload()
-            # Envoie les données au topic Kafka "voltage_data"
-            data = {'type': 'voltage', 'data': payload} 
-            self.producer.produce('voltage_data', value=json.dumps(data).encode('utf-8'))
-            print(f"Voltage data sent: {payload}")
-
-        # Simule la génération de tension
-        voltage = random.uniform(0, 600)  # Génère une tension simulée
-        voltage_metric.set(voltage)  # Mise à jour de la métrique Prometheus
-        print(f"Voltage simulated: {voltage}")
+        """Send a canonical voltage reading to the sensor-data topic."""
+        voltage = float(self.voltage_provider.voltage())
+        message = {
+            "meter_id": self.meter_id,
+            "voltage": round(voltage, 3),
+            "timestamp": float(int(time.time())),
+        }
+        self._send(SENSOR_TOPIC, message)
+        voltage_metric.set(voltage)
+        print(f"sensor-data <- {message}")
 
     @task(1)
-    def get_forecast(self):
-        """Simule la récupération de prévisions et envoie à Kafka."""
-        subject = self.voltage_provider.get_subject()
-        if subject == ".temperature.forecast.12":
-            payload = self.voltage_provider.get_payload()
-            data = {'type': 'forecast', 'data': payload} 
-            self.producer.produce('forecast_data', value=json.dumps(data).encode('utf-8'))
-            # Envoie les données de prévisions au topic Kafka "forecast_data"
-            print(f"Forecast data sent: {payload}")
+    def send_forecast_request(self):
+        """Send a forecast request (future timestamp, no voltage) for app5 to predict."""
+        message = {
+            "meter_id": self.meter_id,
+            "voltage": None,
+            "timestamp": float(int(time.time()) + 3600),  # one hour ahead
+        }
+        self._send(FORECAST_TOPIC, message)
+        print(f"forecast-data <- {message}")
 
-    @task(4)
+    @task(1)
     def simulate_cpu_usage(self):
-        """Simule et enregistre l'utilisation du CPU."""
         cpu_usage = random.uniform(10, 90)
         cpu_usage_metric.set(cpu_usage)
-        print(f"CPU usage simulated: {cpu_usage}")
 
-class KafkaUser(HttpUser):
+
+class KafkaUser(User):
+    """A non-HTTP user: it talks to Kafka directly, not over HTTP."""
     tasks = [SmartMeterBehavior]
-    wait_time = between(1, 3)  # Temps d'attente entre les tâches (1 à 3 secondes)
+    wait_time = between(1, 3)

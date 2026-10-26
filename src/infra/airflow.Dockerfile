@@ -24,8 +24,6 @@ RUN apt-get update && \
     wget -qO- https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz | tar -xz -C /opt/ && \
     mv /opt/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION} $SPARK_HOME && \
     apt-get clean
-   # && rm -rf /var/lib/apt/lists/*
-
 
 RUN chmod 777 /opt/ivy2/
 RUN chmod 777 /opt/airflow/scripts/
@@ -34,11 +32,17 @@ ENV PATH=$JAVA_HOME/bin:$SPARK_HOME/bin:$PATH
 
 
 COPY ./src/scripts/init-airflow-spark-connection.py /opt/airflow/scripts/
-
-# Copy pyproject.toml and pdm.lock files
 COPY ./pyproject.toml /opt/airflow/
 
 USER airflow
 
-# Install Python dependencies using pdm
-RUN pip install apache-airflow-providers-apache-spark mlflow confluent_kafka
+# Two-step install avoids pip's resolver backtracking ("ResolutionTooDeep"):
+#   1) Airflow provider + light deps, pinned by Airflow's official constraints;
+#   2) MLflow on its own, against the now-frozen Airflow set.
+ARG AIRFLOW_VERSION=2.10.3
+ARG PYTHON_VERSION=3.12
+ARG CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+RUN pip install --no-cache-dir \
+        apache-airflow-providers-apache-spark confluent-kafka prometheus_client \
+        --constraint "${CONSTRAINT_URL}"
+RUN pip install --no-cache-dir "mlflow==2.17.2"

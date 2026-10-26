@@ -1,31 +1,31 @@
+"""SparkApp3 - register the Hive external table over the data-lake folder.
+
+Creates ``default.ddd`` as an EXTERNAL parquet table pointing at the folder that
+app2 writes to, so the ingested data is queryable through the metastore.
+Requires a configured Hive metastore (see the spark.hadoop.* settings in the DAG).
+"""
 from pyspark.sql import SparkSession
 
-# Initialize Spark session with Hive support
-spark = SparkSession.builder \
-    .appName("CreateHiveTable") \
-    .enableHiveSupport() \
+spark = (
+    SparkSession.builder
+    .appName("CreateHiveTable")
+    .enableHiveSupport()
     .getOrCreate()
+)
 
-query = """
-CREATE EXTERNAL TABLE IF NOT EXISTS ddd 
-( meter_id INT,
-    voltage DOUBLE,
-    timestamp DOUBLE,
-    processed_time timestamp) 
-    STORED AS PARQUET 
+spark.sql("""
+    CREATE EXTERNAL TABLE IF NOT EXISTS default.ddd (
+        meter_id INT,
+        voltage DOUBLE,
+        timestamp DOUBLE,
+        processed_time TIMESTAMP
+    )
+    STORED AS PARQUET
     LOCATION 'hdfs://namenode:9000/user/hive/warehouse/ddd'
-"""
+""")
 
-# Exécuter la commande CREATE TABLE
-
-spark.sql(query)
-
-spark.sql("SELECT * FROM default.ddd").show()
-
-print('######### SHOW TABLES AFTER INSERTION #########')
-
-# # Exécuter la commande DESCRIBE TABLE
-describe_df = spark.sql(f"DESCRIBE EXTENDED default.ddd")
-
-# Afficher les résultats de la commande DESCRIBE TABLE
-print(describe_df.collect())
+# Refresh so newly landed parquet files are visible, then show a sample.
+spark.sql("MSCK REPAIR TABLE default.ddd")
+print("######### Hive table default.ddd is ready #########")
+spark.sql("SELECT * FROM default.ddd LIMIT 10").show()
+print(spark.sql("DESCRIBE EXTENDED default.ddd").collect())

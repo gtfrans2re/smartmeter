@@ -1,73 +1,72 @@
+"""SparkApp1 - streaming max-voltage aggregation.
+
+Reads raw smart-meter JSON from the ``sensor-data`` Kafka topic, computes the
+maximum voltage per 1-minute event-time window, exposes it as a Prometheus
+gauge on :8001 and republishes each window result to the ``processed-voltage``
+Kafka topic.
+"""
 import json
 import pyspark.sql.functions as F
-from app.spark.common import TransformationBase
+from app.spark.common import TransformationBase, Utilities
+from app.spark.common.kafkaconfig import KafkaConfig
 from prometheus_client import start_http_server, Gauge
 from confluent_kafka import Producer
 
-# Démarrer le serveur Prometheus pour exposer les métriques
+# Prometheus metrics endpoint for this driver.
 start_http_server(8001)
-
-# Définir une métrique pour le maximum de voltage
 max_voltage_metric = Gauge('spark_app1_max_voltage', 'Maximum voltage processed by SparkApp1')
 
-# Configuration de Kafka Producer
-kafka_conf = {
-    'bootstrap.servers': 'kafka:9092',
-    'client.id': 'spark-app1-producer'
-}
+_kafka = KafkaConfig()
+kafka_conf = {'bootstrap.servers': _kafka.bootstrap_servers, 'client.id': 'spark-app1-producer'}
 
 
 class Transformation(TransformationBase):
-    PROCESS_NAME = "SparkApp1-DeltaProcessor"
+    PROCESS_NAME = "SparkApp1-MaxVoltage"
 
     def __init__(self):
         super().__init__()
-        self.producer = Producer(kafka_conf)  # Initialiser le producteur Kafka
+        self.utils = Utilities()
+        self.producer = Producer(kafka_conf)
 
     def read(self):
-        # Lire depuis Kafka en streaming
-        self.source_df = self.reader.read_stream_from_kafka()
-
-    def write(self):
-        # Fonction pour envoyer les données à Kafka
-        def send_to_kafka(batch_df, batch_id):
-            try:
-                for row in batch_df.collect():
-                    message = {"max_voltage": row["max_voltage"], "window": str(row["window"])}
-                    self.producer.produce(
-                        topic='processed-voltage',
-                        value=json.dumps(message).encode('utf-8')
-                    )
-                    self.producer.flush()
-                    print(f"Message sent to Kafka: {message}")
-            except Exception as e:
-                print(f"Error sending message to Kafka: {e}")
-
-        # Écrire les données transformées dans Kafka en batch
-        self.final_df.writeStream.foreachBatch(send_to_kafka).start().awaitTermination()
+        self.source_df = self.reader.read_stream_from_kafka()  # sensor-data
 
     def transform(self):
-        # Transformation pour obtenir la tension maximale
+        parsed = self.utils.parse_sensor_stream(self.source_df)
         self.final_df = (
-            self.source_df.selectExpr("CAST(value AS STRING) as message")
-            .withColumn("voltage", F.expr("CAST(split(message, ',')[1] AS DOUBLE)"))
-            .withColumn("timestamp", F.current_timestamp())
-            # Ajouter un watermark (5 minutes dans cet exemple)
-            .withWatermark("timestamp", "5 minutes")
-            .groupBy(F.window("timestamp", "1 minute"))
+            parsed
+            .withColumn("event_time", F.to_timestamp(F.col("timestamp")))
+            .withWatermark("event_time", "5 minutes")
+            .groupBy(F.window("event_time", "1 minute"))
             .agg(F.max("voltage").alias("max_voltage"))
         )
+        print("Transformation ready")
 
-        # Mettre à jour la métrique Prometheus
-        def update_metrics(batch_df, batch_id):
+    def write(self):
+        producer = self.producer
+
+        def handle_batch(batch_df, batch_id):
             for row in batch_df.collect():
-                max_voltage_metric.set(row["max_voltage"])
-                print(f"Prometheus metric updated: max_voltage = {row['max_voltage']}")
+                max_voltage = row["max_voltage"]
+                if max_voltage is None:
+                    continue
+                max_voltage_metric.set(max_voltage)
+                message = {"max_voltage": max_voltage, "window": str(row["window"])}
+                producer.produce(
+                    topic=KafkaConfig().output_topic,
+                    value=json.dumps(message).encode("utf-8"),
+                )
+                producer.flush()
+                print(f"Max voltage published: {message}")
 
-        # Appliquer la mise à jour des métriques en batch
-        self.final_df.writeStream.foreachBatch(update_metrics).start()
-
-        print("Transformation réussie")
+        (
+            self.final_df.writeStream
+            .outputMode("update")
+            .option("checkpointLocation", "/tmp/spark-app1-checkpoint")
+            .foreachBatch(handle_batch)
+            .start()
+            .awaitTermination()
+        )
 
 
 if __name__ == "__main__":

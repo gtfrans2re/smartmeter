@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Airflow logs (keep the folder, ignore its contents)
+/src/logs/airflow/*
+!/src/logs/airflow/.gitkeep
+
+# MLflow local store (bind-mounted from the mlflow container)
+/mlflow/
